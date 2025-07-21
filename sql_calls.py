@@ -47,9 +47,18 @@ def execute_sql(query):
 
 # 4. Convert result to natural language using final answer prompt
 def generate_final_answer(user_question, result_df):
+    # Handle error string first
     if isinstance(result_df, str):
         return "The SQL query could not be completed due to a syntax or logic error."
 
+    # If it's a list (from AgentState), convert to DataFrame
+    if isinstance(result_df, list):
+        # If list is empty, treat as empty DataFrame
+        if not result_df:
+            return "The query returned no results."
+        result_df = pd.DataFrame(result_df)
+
+    # Now, result_df is guaranteed to be a DataFrame
     if result_df.empty:
         return "The query returned no results."
 

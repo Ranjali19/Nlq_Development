@@ -1,13 +1,14 @@
 from pydantic import BaseModel
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Any
 from pandas import DataFrame
 
 class AgentState(BaseModel):
     user_query: str
     clarified_query: Optional[str] = None
+    last_ambiguous_query: Optional[str] = None
     is_safe: Optional[bool] = None
     sql_query: Optional[str] = None
-    result: Optional[Union[str, dict, DataFrame]] = None
+    result: Optional[Any] = None
     answer: Optional[str] = None
     needs_clarification: Optional[bool] = None
     clarification_question: Optional[str] = None
@@ -19,8 +20,10 @@ class AgentState(BaseModel):
     feedback: Optional[str] = None
     previous_answer: Optional[str] = None
     missing_info: Optional[str] = None
-    retries: int = 0
-    memory: Optional[Dict[str, Any]] = {}
-    chat_history: Optional[list] = []  
-
-    model_config = {"arbitrary_types_allowed": True}
+    retries: int = 0  
+    waiting_for_clarification: bool = False
+    pending_human_review: bool = False
+    chat_history: list = []
+    model_config = {
+        "arbitrary_types_allowed": True
+    }

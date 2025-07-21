@@ -2,10 +2,15 @@ import streamlit as st
 import os
 import sqlite3
 import pandas as pd
-import uuid
+import json
+import base64
+import gc
+import time
+import shutil
 from typing import List
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
+from openai import OpenAI as OfficialOpenAI
 
 from graph import build_graph, AgentState
 from sql_calls import generate_sql, execute_sql, generate_final_answer
@@ -17,63 +22,17 @@ from vectors import (
     build_dual_retriever_system,
 )
 
-# -- 1. SQLite setup for message memory --
-DB_PATH = "chat_memory.db"
-def init_memory_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            thread_id TEXT,
-            role TEXT,
-            content TEXT,
-            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-init_memory_db()
+# Load OpenAI API Key
+load_dotenv()
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+client = OfficialOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-def save_message(thread_id, role, content):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO messages (thread_id, role, content) VALUES (?, ?, ?)",
-        (thread_id, role, content)
-    )
-    conn.commit()
-    conn.close()
+SQLITE_DB = "uploaded_my_chat_.db"
+INDEX_DIR = "index_storage"
 
-def fetch_chat_history(thread_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT role, content FROM messages WHERE thread_id = ? ORDER BY ts ASC",
-        (thread_id,)
-    )
-    history = [{"role": row[0], "content": row[1]} for row in c.fetchall()]
-    conn.close()
-    return history
-
-# -- 2. Streamlit session state initialization --
-if "engine" not in st.session_state:
-    st.session_state["engine"] = create_engine("sqlite:///uploaded_my_chat_.db", echo=False)
-if "initialized" not in st.session_state:
-    st.session_state.initialized = True
-    st.session_state.table_infos = []
-    st.session_state.schema_retriever = None
-    st.session_state.table_info_retriever = None
-    st.session_state.agent = build_graph()
-if "pending_agent_state" not in st.session_state:
-    st.session_state.pending_agent_state = None
-if "pending_question" not in st.session_state:
-    st.session_state.pending_question = None
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())   # Unique per session/chat
+st.session_state["engine"] = create_engine(f"sqlite:///{SQLITE_DB}", echo=False)
 
 def delete_old_indexes(engine):
-    import shutil, gc, time
-    INDEX_DIR = "index_storage"
     if os.path.exists(INDEX_DIR):
         try:
             st.session_state.schema_retriever = None
@@ -90,8 +49,19 @@ def delete_old_indexes(engine):
             st.error(f"Failed to delete old indexes: {e}")
 
 def main():
-    st.set_page_config(page_title="Semantic SQL Chat", layout="wide")
+    if "engine" not in st.session_state:
+        st.session_state["engine"] = create_engine(f"sqlite:///{SQLITE_DB}", echo=False)
+
     engine = st.session_state["engine"]
+    st.set_page_config(page_title="Semantic SQL Chat", layout="wide")
+
+    if "initialized" not in st.session_state:
+        st.session_state.initialized = True
+        st.session_state.table_infos = []
+        st.session_state.chat_history = []
+        st.session_state.schema_retriever = None
+        st.session_state.table_info_retriever = None
+        st.session_state.agent = build_graph()
 
     left, right = st.columns([0.2, 0.8])
 
@@ -103,7 +73,9 @@ def main():
         if files and not st.session_state.table_info_retriever:
             delete_old_indexes(engine)
             drop_all_tables(engine)
+
             st.session_state.table_infos = []
+            st.session_state.chat_history = []
 
             with st.spinner("Processing files..."):
                 infos = upload_multiple_excels_to_sqlite(files, engine)
@@ -122,6 +94,7 @@ def main():
     with right:
         st.markdown("<h2 style='text-align:right; color:white;'> SQL Chat</h2>", unsafe_allow_html=True)
 
+        # Chat styling
         st.markdown("""
             <style>
                 .chat-bubble {
@@ -144,90 +117,41 @@ def main():
             </style>
         """, unsafe_allow_html=True)
 
-        # Rebuild history from SQLite (persistent for thread_id)
-        thread_id = st.session_state.thread_id
-        chat_history = fetch_chat_history(thread_id)
-
+        # Chat history
         with st.container():
-            for entry in chat_history:
-                if entry["role"] == "user":
-                    st.markdown(f"""
-                        <div class='chat-container'>
-                            <div class='chat-bubble'>
-                                <strong>🧑 You:</strong><br>{entry['content']}
-                            </div>
+            for entry in st.session_state.chat_history:
+                st.markdown(f"""
+                    <div class='chat-container'>
+                        <div class='chat-bubble'>
+                            <strong>🧑 You:</strong><br>{entry['question']}
                         </div>
-                    """, unsafe_allow_html=True)
-                else:  # assistant
-                    st.markdown(f"""
-                        <div class='chat-container'>
-                            <div class='chat-bubble assistant'>
-                                <strong>🤖 Assistant:</strong><br>{entry['content']}
-                            </div>
+                        <div class='chat-bubble assistant'>
+                            <strong>🤖 Assistant:</strong><br>{entry['answer']}
                         </div>
-                    """, unsafe_allow_html=True)
+                    </div>
+                """, unsafe_allow_html=True)
+                if entry.get("graph"):
+                    st.image(base64.b64decode(entry["graph"]), caption="Generated Graph")
 
-        # --------- New User Input (with HITL support) ---------
-        if st.session_state.pending_question:
-            user_prompt = st.session_state.pending_question
-        else:
-            user_prompt = "Ask Anything"
-
+        # --------- New User Input ---------
         with st.form("chat_form", clear_on_submit=True):
-            user_query = st.text_input(user_prompt, key="chat_input", placeholder="e.g., Show me sales trend for bikes...")
+            user_query = st.text_input("Ask Anything", key="chat_input", placeholder="e.g., Show me sales trend for bikes...")
             send = st.form_submit_button("Ask")
 
         if send and user_query.strip():
             with st.spinner("⏳ Thinking..."):
-                # Is this a clarification or new chat?
-                if st.session_state.pending_agent_state is not None:
-                    previous_state = st.session_state.pending_agent_state
-                    hist = fetch_chat_history(thread_id)
-                    hist.append({"role": "user", "content": user_query})
-                    agent_state = AgentState(
-                        **previous_state.model_dump(),
-                        user_query=user_query,
-                        chat_history=hist
-                    )
-                    st.session_state.pending_agent_state = None
-                    st.session_state.pending_question = None
-                else:
-                    hist = fetch_chat_history(thread_id)
-                    hist.append({"role": "user", "content": user_query})
-                    agent_state = AgentState(user_query=user_query, chat_history=hist)
-
-                # Save user turn
-                save_message(thread_id, "user", user_query)
-
-                # Run the agent graph
+                agent_state = AgentState(user_query=user_query)
                 result_state = st.session_state.agent.invoke(agent_state, {"recursion_limit": 35})
+                result_obj = AgentState(**result_state)
 
-                # Human-in-the-loop interrupt?
-                interrupt_flag = False
-                if hasattr(result_state, "interrupt"):
-                    # This is a returned Command from interrupt()
-                    interrupt_flag = result_state.interrupt == "human"
-                elif isinstance(result_state, dict) and "interrupt" in result_state:
-                    interrupt_flag = result_state["interrupt"] == "human"
+                chat_entry = {
+                    "question": user_query,
+                    "answer": result_obj.answer or "",
+                }
+                if getattr(result_obj, "graph", None):
+                    chat_entry["graph"] = result_obj.graph
+                st.session_state.chat_history.append(chat_entry)
 
-                if interrupt_flag:
-                    clarification_msg = getattr(result_state, "clarification_question", None) or getattr(result_state, "answer", None) or "Can you clarify?"
-                    st.session_state.pending_agent_state = agent_state
-                    st.session_state.pending_question = clarification_msg
-                    save_message(thread_id, "assistant", clarification_msg)
-                else:
-                    result_obj = AgentState(**result_state)
-                    assistant_reply = result_obj.answer or ""
-                    save_message(thread_id, "assistant", assistant_reply)
-
-            st.rerun()
-
-    # (Optional) Button to start a new thread/conversation
-    with st.sidebar:
-        if st.button("Start New Chat"):
-            st.session_state.thread_id = str(uuid.uuid4())
-            st.session_state.pending_agent_state = None
-            st.session_state.pending_question = None
             st.rerun()
 
 if __name__ == "__main__":
